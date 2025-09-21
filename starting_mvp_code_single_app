@@ -1,0 +1,485 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+// Organization Buddy – Timer + Bins + 10‑Out
+// TailwindCSS styling; shadcn/ui components
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Progress } from "@/components/ui/progress";
+import { Switch } from "@/components/ui/switch";
+import { Plus, Pause, Play, RotateCcw, Trash2 } from "lucide-react";
+
+// ---- Helpers ----
+const fmt = (s: number) => {
+  const m = Math.floor(s / 60).toString().padStart(2, "0");
+  const x = Math.floor(s % 60).toString().padStart(2, "0");
+  return `${m}:${x}`;
+};
+
+const useLocal = <T,>(key: string, init: T) => {
+  const [val, setVal] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? (JSON.parse(raw) as T) : init;
+    } catch {
+      return init;
+    }
+  });
+  useEffect(() => localStorage.setItem(key, JSON.stringify(val)), [key, val]);
+  return [val, setVal] as const;
+};
+
+// ---- Component ----
+export default function OrganizationBuddy() {
+  // Timer
+  const [workMin, setWorkMin] = useLocal<number>("buddy.workMin", 20);
+  const [breakMin, setBreakMin] = useLocal<number>("buddy.breakMin", 5);
+  const [seconds, setSeconds] = useLocal<number>("buddy.seconds", workMin * 60);
+  const [isRunning, setIsRunning] = useLocal<boolean>("buddy.running", false);
+  const [mode, setMode] = useLocal<"work" | "break">("buddy.mode", "work");
+  const intervalRef = useRef<number | null>(null);
+
+  // UI toggles, sounds, and helpers
+  const [relocateOn, setRelocateOn] = useLocal<boolean>("buddy.relocate", true);
+  const [essentialsOn, setEssentialsOn] = useLocal<boolean>("buddy.essentials", true);
+  const [showRules, setShowRules] = useLocal<boolean>("buddy.showRules", true);
+  const [muted, setMuted] = useLocal<boolean>("buddy.muted", false);
+  const [volume, setVolume] = useLocal<number>("buddy.volume", 0.6);
+  const [shouldDing, setShouldDing] = useState(false);
+
+  // Categories (seeded from our locked list)
+  const defaultCats = [
+    { id: "fish", name: "Fish Tank", examples: "food, Prime, nets", room: "Main Loft" },
+    { id: "diy", name: "DIY Electronics", examples: "Arduinos, LEDs, solder", room: "Loft" },
+    { id: "personal", name: "Personal Electronics", examples: "camera, VR, chargers", room: "Living/Office" },
+    { id: "kitchen", name: "Kitchen/Dishes", examples: "plates, cups, utensils", room: "Kitchen" },
+    { id: "desk", name: "Desk/Office & Mail", examples: "pens, notebooks, mail", room: "Desk" },
+    { id: "clothes", name: "Clothes/Laundry", examples: "clothes, towels, sheets", room: "Bedroom" },
+    { id: "trash", name: "Trash/Recycling", examples: "packaging, broken", room: "Door" },
+    { id: "donate", name: "Donate/Returns", examples: "unused 90d+, returns", room: "Door" },
+  ];
+  const [cats, setCats] = useLocal("buddy.cats", defaultCats);
+  const [newCat, setNewCat] = useState({ name: "", examples: "", room: "" });
+  const addCat = () => {
+    if (!newCat.name.trim()) return;
+    setCats([
+      ...cats,
+      { id: crypto.randomUUID(), name: newCat.name.trim(), examples: newCat.examples.trim(), room: newCat.room.trim() },
+    ]);
+    setNewCat({ name: "", examples: "", room: "" });
+  };
+  const removeCat = (id: string) => setCats(cats.filter((c: any) => c.id !== id));
+
+  // Round targets, notes, and counters
+  const [roundTargets, setRoundTargets] = useLocal<string[]>("buddy.targets", []);
+  const [notes, setNotes] = useLocal("buddy.notes", "");
+  const [tenOutCount, setTenOutCount] = useLocal<number>("buddy.tenOut", 0);
+  const [log, setLog] = useLocal<{ ts: string; mode: string; duration: number; target: string }[]>("buddy.log", []);
+  const logRound = () => {
+    const target = roundTargets.join(", ") || (mode === "work" ? "Work" : "Break");
+    setLog([{ ts: new Date().toLocaleString(), mode, duration: mode === "work" ? workMin : breakMin, target }, ...log]);
+  };
+
+  // Timer helpers
+  const pct = useMemo(() => {
+    const total = mode === "work" ? workMin * 60 : breakMin * 60;
+    return Math.max(0, Math.min(100, ((total - seconds) / total) * 100));
+  }, [seconds, workMin, breakMin, mode]);
+
+  const start = () => setIsRunning(true);
+  const pause = () => setIsRunning(false);
+  const reset = () => { setIsRunning(false); setMode("work"); setSeconds(workMin * 60); };
+  const skip = () => {
+    const nextMode = mode === "work" ? "break" : "work";
+    setMode(nextMode);
+    setSeconds(nextMode === "work" ? workMin * 60 : breakMin * 60);
+  };
+
+  useEffect(() => {
+    if (!isRunning) return;
+    intervalRef.current = window.setInterval(() => {
+      setSeconds((s) => {
+        if (s <= 1) {
+          const nextMode = mode === "work" ? "break" : "work";
+          setMode(nextMode);
+          setShouldDing(true);
+          return nextMode === "work" ? workMin * 60 : breakMin * 60;
+        }
+        return s - 1;
+      });
+    }, 1000);
+    return () => { if (intervalRef.current) window.clearInterval(intervalRef.current); };
+  }, [isRunning, mode, workMin, breakMin]);
+
+  // Play a short tone at segment change
+  useEffect(() => {
+    if (!shouldDing || muted) return;
+    setShouldDing(false);
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.value = mode === "break" ? 880 : 660;
+      g.gain.value = volume;
+      o.connect(g); g.connect(ctx.destination);
+      o.start();
+      setTimeout(() => { o.stop(); ctx.close(); }, 350);
+    } catch {}
+  }, [shouldDing, muted, volume, mode]);
+
+  return (
+    <div className="mx-auto max-w-6xl p-6 space-y-6">
+      <div className="grid gap-6 md:grid-cols-3">
+        {/* Timer Card */}
+        <Card className="md:col-span-2 shadow-lg rounded-2xl">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-2xl">Focus Timer</CardTitle>
+            <div className="text-sm text-muted-foreground">Work in finishable rounds. Default 20 / 5. Mode: <span className="font-medium">{mode.toUpperCase()}</span></div>
+            <div className="text-xs text-muted-foreground">Use this to time short, finishable sessions. It will auto-switch Work↔Break and play a chime.</div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="text-5xl font-mono tabular-nums">{fmt(seconds)}</div>
+              <div className="flex items-center gap-2">
+                {!isRunning ? (
+                  <Button onClick={start} className="rounded-2xl"><Play className="mr-2 h-4 w-4"/>Start</Button>
+                ) : (
+                  <Button variant="secondary" onClick={pause} className="rounded-2xl"><Pause className="mr-2 h-4 w-4"/>Pause</Button>
+                )}
+                <Button variant="outline" onClick={reset} className="rounded-2xl"><RotateCcw className="mr-2 h-4 w-4"/>Reset</Button>
+                <Button variant="ghost" onClick={skip} className="rounded-2xl">Skip</Button>
+              </div>
+            </div>
+            <Progress value={pct} className="h-2" />
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex items-center gap-2">
+                <span className="text-sm w-20">Work min</span>
+                <Input type="number" min={1} max={90} value={workMin} onChange={(e) => setWorkMin(Number(e.target.value || 0))} />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm w-20">Break min</span>
+                <Input type="number" min={1} max={30} value={breakMin} onChange={(e) => setBreakMin(Number(e.target.value || 0))} />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3 items-center">
+              <div className="flex items-center gap-2">
+                <Switch checked={!muted} onCheckedChange={(v) => setMuted(!Boolean(v))} />
+                <span className="text-sm">Chime on segment change</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm w-20">Volume</span>
+                <Input type="range" min={0} max={1} step={0.05} value={volume} onChange={(e) => setVolume(Number(e.target.value))} />
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <Switch checked={essentialsOn} onCheckedChange={setEssentialsOn} />
+              <span className="text-sm">Show helper trays: <span className="font-medium">Essentials – Tonight</span></span>
+            </div>
+            <div className="flex items-center gap-3">
+              <Switch checked={relocateOn} onCheckedChange={setRelocateOn} />
+              <span className="text-sm">Show helper tray: <span className="font-medium">Relocate – To Other Room</span></span>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={logRound} className="rounded-2xl">Log Segment</Button>
+            </div>
+
+            {/* Round directions */}
+            <div className="border rounded-xl p-3 bg-muted/30">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-medium">Round directions</div>
+                <div className="flex items-center gap-2 text-xs"><span>Show</span><Switch checked={showRules} onCheckedChange={setShowRules} /></div>
+              </div>
+              {showRules && <RoundDirections mode={mode} />}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 10-Out & Notes */}
+        <Card className="shadow-lg rounded-2xl">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-xl">10‑Out & Notes</CardTitle>
+            <div className="text-xs text-muted-foreground">Track how many items you removed this round and jot blockers or next steps.</div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center gap-2">
+              <span className="text-sm">10‑Out count</span>
+              <Input type="number" min={0} value={tenOutCount} onChange={(e) => setTenOutCount(Number(e.target.value || 0))} className="w-24"/>
+              <Button variant="outline" onClick={() => setTenOutCount((x) => x + 1)} className="rounded-2xl">+1</Button>
+              <Button variant="ghost" onClick={() => setTenOutCount(0)} className="rounded-2xl">Reset</Button>
+            </div>
+            <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Quick notes, obstacles, next target…"/>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Tabs defaultValue="bins" className="w-full">
+        <TabsList className="grid w-full grid-cols-3">
+          <TabsTrigger value="bins">Bins</TabsTrigger>
+          <TabsTrigger value="targets">Targets</TabsTrigger>
+          <TabsTrigger value="log">Log</TabsTrigger>
+        </TabsList>
+        <TabsContent value="bins" className="space-y-4">
+          {/* Helper trays */}
+          {(essentialsOn || relocateOn) && (
+            <div className="grid md:grid-cols-2 gap-4">
+              {essentialsOn && (
+                <Card className="rounded-2xl">
+                  <CardHeader className="pb-2"><CardTitle className="text-lg">Helper Tray – Essentials (Tonight)</CardTitle><div className="text-xs text-muted-foreground">Keep tonight/tomorrow must‑haves visible so you don’t bury them.</div></CardHeader>
+                  <CardContent>
+                    <CheckList storageKey="buddy.essentials" placeholder="Add essential item…"/>
+                    <SegmentNotes storageKey="buddy.essentials.notes" questions={["What do I need in the next 24h?","What keeps getting lost that should live here?"]}/>
+                  </CardContent>
+                </Card>
+              )}
+              {relocateOn && (
+                <Card className="rounded-2xl">
+                  <CardHeader className="pb-2"><CardTitle className="text-lg">Helper Tray – Relocate (To Other Room)</CardTitle><div className="text-xs text-muted-foreground">Stage items that belong elsewhere; move them at the end of the round.</div></CardHeader>
+                  <CardContent>
+                    <CheckList storageKey="buddy.relocateList" placeholder="Add item to move later…"/>
+                    <SegmentNotes storageKey="buddy.relocate.notes" questions={["Which room is its true home?","Can I reduce relos by adding a small bin there?"]}/>
+                  </CardContent>
+                </Card>
+              )}
+            </div>
+          )}
+
+          {/* Category bins */}
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+            {cats.map((c: any) => (
+              <Card key={c.id} className="rounded-2xl">
+                <CardHeader className="pb-2">
+                  <div className="text-xs text-muted-foreground">Put matching items here during the sweep. You can sort sub‑bins later.</div>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <CardTitle className="text-base">{c.name}</CardTitle>
+                      <div className="text-xs text-muted-foreground">{c.examples} — <span className="font-medium">{c.room}</span></div>
+                    </div>
+                    <Button size="icon" variant="ghost" onClick={() => removeCat(c.id)} title="Remove bin"><Trash2 className="h-4 w-4"/></Button>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  <CheckList storageKey={`buddy.bin.${c.id}`} placeholder={`Add to ${c.name}…`}/>
+                  <SegmentNotes storageKey={`buddy.bin.${c.id}.notes`} questions={["What belongs in this bin for real?","What can I donate today?","What sub‑bins will I need when I sort?"]}/>
+                </CardContent>
+              </Card>
+            ))}
+            {/* Add new bin */}
+            <Card className="border-dashed rounded-2xl">
+              <CardHeader className="pb-2"><CardTitle className="text-base">Add Bin</CardTitle></CardHeader>
+              <CardContent className="space-y-2">
+                <Input placeholder="Name" value={newCat.name} onChange={(e) => setNewCat({ ...newCat, name: e.target.value })}/>
+                <Input placeholder="Examples (3)" value={newCat.examples} onChange={(e) => setNewCat({ ...newCat, examples: e.target.value })}/>
+                <Input placeholder="Room" value={newCat.room} onChange={(e) => setNewCat({ ...newCat, room: e.target.value })}/>
+                <Button onClick={addCat} className="rounded-2xl"><Plus className="mr-2 h-4 w-4"/>Add</Button>
+              </CardContent>
+            </Card>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="targets" className="space-y-4">
+          <Card className="rounded-2xl">
+            <CardHeader className="pb-2"><CardTitle className="text-lg">Round Targets</CardTitle><div className="text-xs text-muted-foreground">List the tiny areas you’ll focus on in upcoming rounds.</div></CardHeader>
+            <CardContent>
+              <RoundTargets value={roundTargets} onChange={setRoundTargets} />
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="log" className="space-y-4">
+          <Card className="rounded-2xl">
+            <CardHeader className="pb-2"><CardTitle className="text-lg">Session Log</CardTitle><div className="text-xs text-muted-foreground">Simple history of segments you’ve logged.</div></CardHeader>
+            <CardContent className="space-y-3">
+              {log.length === 0 && <div className="text-sm text-muted-foreground">No segments logged yet.</div>}
+              <ul className="space-y-2">
+                {log.map((L, i) => (
+                  <li key={i} className="text-sm flex items-center justify-between border-b pb-2">
+                    <span>{L.ts} — <span className="font-medium uppercase">{L.mode}</span> {L.duration}m — {L.target}</span>
+                  </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+
+      {/* Round Steps & Motivation */}
+      <div className="grid gap-6 md:grid-cols-3">
+        <Card className="rounded-2xl md:col-span-2">
+          <CardHeader className="pb-2"><CardTitle className="text-lg">Step‑by‑Step for this Round</CardTitle><div className="text-xs text-muted-foreground">Check these off as you move through a work segment.</div></CardHeader>
+          <CardContent>
+            <StepsList storageKey="buddy.steps.work" defaults={["Pick one 2–3 ft micro‑target","Trash → Donate → Relocate → Bin","Add items to correct bin only","Aim for 10‑Out","Essentials stay out","End: wipe surface, take bags to door"]} />
+          </CardContent>
+        </Card>
+        <Card className="rounded-2xl">
+          <CardHeader className="pb-2"><CardTitle className="text-lg">Motivation</CardTitle><div className="text-xs text-muted-foreground">Tiny nudges to keep momentum.</div></CardHeader>
+          <CardContent className="space-y-3">
+            <MotivationBox />
+          </CardContent>
+        </Card>
+      </div>
+
+      <footer className="text-xs text-muted-foreground text-center pt-2">
+        Built for fast, low-decision organizing. Categories seeded from our locked list. Data is saved to your browser.
+      </footer>
+    </div>
+  );
+}
+
+// ---- Segment Notes ----
+function SegmentNotes({ storageKey, questions }: { storageKey: string; questions: string[] }) {
+  const [text, setText] = useLocal<string>(storageKey, "");
+  return (
+    <div className="mt-3 space-y-2">
+      <div className="text-xs text-muted-foreground">Notes</div>
+      <Textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="Write quick thoughts, decisions, or blockers…" />
+      <div className="text-xs text-muted-foreground">Prompts:
+        <ul className="list-disc pl-5 mt-1">
+          {questions.map((q, i) => (<li key={i}>{q}</li>))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+// ---- Steps list ----
+function StepsList({ storageKey, defaults }: { storageKey: string; defaults: string[] }) {
+  const [items, setItems] = useLocal<any>(storageKey, []);
+  const list = Array.isArray(items) ? (items as { id: string; text: string; done: boolean }[]) : [];
+  useEffect(() => {
+    if (!Array.isArray(items)) setItems([]);
+  }, [items, setItems]);
+  useEffect(() => {
+    if (list.length === 0 && defaults.length) {
+      setItems(defaults.map((t) => ({ id: crypto.randomUUID(), text: t, done: false })));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const toggle = (id: string, done: boolean) => setItems(list.map((it) => (it.id === id ? { ...it, done } : it)));
+  return (
+    <ul className="space-y-1">
+      {list.map((it) => (
+        <li key={it.id} className="flex items-center gap-2 py-1">
+          <Checkbox checked={it.done} onCheckedChange={(v) => toggle(it.id, Boolean(v))} />
+          <span className={"text-sm " + (it.done ? "line-through text-muted-foreground" : "")}>{it.text}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// ---- Reusable checklist ----
+function CheckList({ storageKey, placeholder }: { storageKey: string; placeholder?: string }) {
+  const [items, setItems] = useLocal<any>(storageKey, []);
+  const list = Array.isArray(items) ? (items as { id: string; text: string; done: boolean }[]) : [];
+  useEffect(() => {
+    if (!Array.isArray(items)) setItems([]);
+  }, [items, setItems]);
+  const [text, setText] = useState("");
+  const add = () => {
+    const t = text.trim();
+    if (!t) return;
+    setItems([{ id: crypto.randomUUID(), text: t, done: false }, ...list]);
+    setText("");
+  };
+  const toggle = (id: string, done: boolean) => setItems(list.map((it) => (it.id === id ? { ...it, done } : it)));
+  const del = (id: string) => setItems(list.filter((it) => it.id !== id));
+  return (
+    <div className="space-y-2">
+      <div className="flex gap-2">
+        <Input value={text} onChange={(e) => setText(e.target.value)} placeholder={placeholder || "Add item…"} onKeyDown={(e) => e.key === "Enter" && add()} />
+        <Button onClick={add} className="rounded-2xl"><Plus className="mr-2 h-4 w-4"/>Add</Button>
+      </div>
+      <ul className="space-y-1">
+        {list.map((it) => (
+          <li key={it.id} className="flex items-center gap-2 py-1">
+            <Checkbox checked={it.done} onCheckedChange={(v) => toggle(it.id, Boolean(v))} />
+            <span className={"text-sm flex-1 " + (it.done ? "line-through text-muted-foreground" : "")}>{it.text}</span>
+            <Button size="icon" variant="ghost" onClick={() => del(it.id)} title="Remove"><Trash2 className="h-4 w-4"/></Button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// ---- Targets editor ----
+function RoundTargets({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+  const [text, setText] = useState("");
+  const add = () => {
+    const t = text.trim();
+    if (!t) return;
+    onChange([t, ...value]);
+    setText("");
+  };
+  const remove = (i: number) => onChange(value.filter((_, j) => j !== i));
+  return (
+    <div className="space-y-2">
+      <div className="flex gap-2">
+        <Input value={text} onChange={(e) => setText(e.target.value)} placeholder="e.g., Living room floor + coffee table" onKeyDown={(e) => e.key === "Enter" && add()} />
+        <Button onClick={add} className="rounded-2xl"><Plus className="mr-2 h-4 w-4"/>Add</Button>
+      </div>
+      <ul className="space-y-1">
+        {value.map((t, i) => (
+          <li key={i} className="flex items-center gap-2 py-1">
+            <span className="text-sm flex-1">{t}</span>
+            <Button size="icon" variant="ghost" onClick={() => remove(i)} title="Remove"><Trash2 className="h-4 w-4"/></Button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// ---- Round directions ----
+function RoundDirections({ mode }: { mode: "work" | "break" }) {
+  const items = mode === "work"
+    ? [
+        "Pick one micro-target (2–3 ft slice). Stay inside it.",
+        "Run 4 decisions: Trash → Donate → Relocate → Bin.",
+        "If you hesitate >5s → Donate.",
+        "Essentials stay out (use the Essentials tray).",
+        "Count 10‑Out as you go (aim ≥10).",
+        "No side quests (don’t start washing/repairing mid-round).",
+        "End with a quick reset: wipe surface; take trash/donate to the door; snap photo.",
+      ]
+    : [
+        "Water + breathe + quick stretch.",
+        "Set the next micro-target (write it in Targets).",
+        "If a bag is ready, take Trash/Donate to the door or out.",
+        "Return in 5—don’t extend breaks unless you choose to.",
+      ];
+  return (
+    <ul className="mt-2 grid gap-1 text-sm list-disc pl-5">
+      {items.map((t, i) => (
+        <li key={i}>{t}</li>
+      ))}
+    </ul>
+  );
+}
+
+// ---- Motivation ----
+function MotivationBox() {
+  const messages = [
+    "Small area, big win.",
+    "Done is better than perfect.",
+    "You’re reducing tomorrow’s load.",
+    "Every 10‑Out is lighter air.",
+    "Future‑you says thanks.",
+  ];
+  const [idx, setIdx] = useLocal<number>("buddy.mot.idx", 0);
+  const next = () => setIdx((i) => (i + 1) % messages.length);
+  return (
+    <div className="space-y-2">
+      <div className="text-sm">{messages[idx]}</div>
+      <div className="flex gap-2">
+        <Button variant="outline" onClick={next} className="rounded-2xl">New boost</Button>
+        <Button variant="ghost" onClick={() => setIdx(0)} className="rounded-2xl">Reset</Button>
+      </div>
+      <div className="text-xs text-muted-foreground">Tip: when you feel stuck, pick the smallest visible slice and start the timer.</div>
+    </div>
+  );
+}
